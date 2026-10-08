@@ -64,6 +64,36 @@ fn long_bindings_stay_inside_their_label_card(cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
+#[test]
+fn narrow_model_keeps_every_callout_separate_and_inside_the_canvas() {
+    for width in [960., 980., 1200.] {
+        let layout = model_layout(None, width, 600., true);
+        assert_eq!(layout.labels.len(), default_hotspots(true).len());
+        for side in [
+            super::super::leader_lines::Side::Left,
+            super::super::leader_lines::Side::Right,
+        ] {
+            let mut cards: Vec<_> = layout
+                .labels
+                .iter()
+                .filter(|label| label.side == side)
+                .collect();
+            cards.sort_by(|a, b| a.y.total_cmp(&b.y));
+            for pair in cards.windows(2) {
+                assert!(
+                    pair[1].y - pair[0].y >= super::super::geometry::LABEL_H,
+                    "{width}px: {:?} and {:?} overlap",
+                    pair[0].id,
+                    pair[1].id
+                );
+            }
+            for card in cards {
+                assert!(card.y + super::super::geometry::LABEL_H / 2. <= layout.canvas_h);
+            }
+        }
+    }
+}
+
 #[gpui::test]
 fn a_selected_gesture_can_render_in_the_binding_inspector(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -82,12 +112,17 @@ fn a_selected_gesture_can_render_in_the_binding_inspector(cx: &mut TestAppContex
         )]);
         let bindings = BTreeMap::new();
         let entity = cx.entity();
+        let target = view.editor_target(cx);
 
         binding_inspector(
             BindingInspectorData {
+                target: &target,
                 selected: Some(MouseControlId::Button(ButtonId::MiddleClick)),
                 gesture_direction: Some(GestureDirection::Up),
                 action_picker_open: false,
+                button_press: view.button_press,
+                shortcut_mode: view.shortcut_mode,
+                custom_inputs: &view.custom_inputs,
                 bindings: &bindings,
                 gesture_maps: &gesture_maps,
                 dpi_gestures: false,
@@ -106,6 +141,48 @@ fn a_selected_gesture_can_render_in_the_binding_inspector(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn selected_button_and_its_custom_picker_render_in_the_owner_view(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    install_app_state(cx);
+    let (view, cx) = cx.add_window_view(MouseModelView::new);
+    view.update(cx, |view, cx| {
+        view.select(MouseControlId::Button(ButtonId::Back));
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.toggle_action_picker(window, cx);
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("custom-shortcut-add").is_some());
+    assert!(cx.debug_bounds("custom-application-add").is_some());
+    assert!(cx.debug_bounds("custom-shortcut-hold").is_some());
+    let row = cx.debug_bounds("custom-shortcut-add").unwrap();
+    cx.simulate_click(
+        gpui::point(row.left() + px(20.), row.center().y),
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_input("not-a-key");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("custom-shortcut-error").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(!view.read_with(cx, |view, _| view.action_picker_open));
+    assert!(cx.debug_bounds("custom-shortcut-add").is_none());
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.toggle_action_picker(window, cx);
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("custom-shortcut-error").is_none());
+}
+
+#[gpui::test]
 fn selecting_another_control_closes_the_action_picker(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     install_app_state(cx);
@@ -119,37 +196,6 @@ fn selecting_another_control_closes_the_action_picker(cx: &mut TestAppContext) {
         view.select(MouseControlId::Button(ButtonId::Forward));
 
         assert!(!view.action_picker_open);
-    });
-    drop(view);
-    cx.update(|window, _| window.remove_window());
-    cx.run_until_parked();
-}
-
-#[gpui::test]
-fn clearing_custom_action_drafts_resets_text_and_invalid_state(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
-    install_app_state(cx);
-    let (view, cx) = cx.add_window_view(MouseModelView::new);
-    cx.run_until_parked();
-
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.custom_shortcut_input
-                .update(cx, |input, cx| input.set_value("Cmd+K", window, cx));
-            view.custom_application_input
-                .update(cx, |input, cx| input.set_value("/bin/true", window, cx));
-            view.custom_shortcut_invalid = true;
-            view.custom_application_invalid = true;
-
-            view.clear_custom_action_drafts(window, cx);
-        });
-    });
-
-    view.update(cx, |view, cx| {
-        assert_eq!(view.custom_shortcut_input.read(cx).value(), "");
-        assert_eq!(view.custom_application_input.read(cx).value(), "");
-        assert!(!view.custom_shortcut_invalid);
-        assert!(!view.custom_application_invalid);
     });
     drop(view);
     cx.update(|window, _| window.remove_window());
@@ -185,4 +231,299 @@ fn fallback_model_only_adds_thumbwheel_when_capability_is_measured() {
             .count(),
         1
     );
+}
+
+fn mouse_state(
+    cx: &mut TestAppContext,
+) -> (
+    Entity<AppState>,
+    tokio::sync::mpsc::UnboundedReceiver<crate::services::ipc::Command>,
+) {
+    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        let profile: openlogi_fixture::DeviceProfile =
+            serde_json::from_str(openlogi_fixture::CANONICAL_DEVICE_PROFILE_JSON).unwrap();
+        let resolver = AssetResolver::new();
+        let (commands, received) = tokio::sync::mpsc::unbounded_channel();
+        let state = cx.new(|_| {
+            let mut state = AppState::new(Sources {
+                inventories: &profile.inventories,
+                ..Sources::in_memory(Config::ephemeral(), &resolver, commands)
+            });
+            let index = state
+                .devices()
+                .iter()
+                .position(|record| {
+                    record.kind == openlogi_core::device::DeviceKind::Mouse
+                        && record.route.is_some()
+                })
+                .unwrap();
+            let _ = state.select_device(index);
+            state
+        });
+        AppState::set_global(state.clone(), cx);
+        (state, received)
+    })
+}
+
+fn open_back_picker(
+    view: &Entity<MouseModelView>,
+    press: ButtonPress,
+    cx: &mut gpui::VisualTestContext,
+) {
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.select(MouseControlId::Button(ButtonId::Back));
+            view.button_press = press;
+            view.toggle_action_picker(window, cx);
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+fn type_custom_shortcut(text: &str, cx: &mut gpui::VisualTestContext) {
+    let row = cx.debug_bounds("custom-shortcut-add").unwrap();
+    cx.simulate_click(
+        gpui::point(row.left() + px(20.), row.center().y),
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_input(text);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+fn submit_custom_shortcut(cx: &mut gpui::VisualTestContext) {
+    let row = cx.debug_bounds("custom-shortcut-add").unwrap();
+    cx.simulate_click(
+        gpui::point(row.right() - px(16.), row.center().y),
+        gpui::Modifiers::default(),
+    );
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+fn click_without_frame(position: gpui::Point<gpui::Pixels>, window: &mut Window, cx: &mut App) {
+    use gpui::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
+
+    window.dispatch_event(
+        PlatformInput::MouseDown(MouseDownEvent {
+            position,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        }),
+        cx,
+    );
+    window.dispatch_event(
+        PlatformInput::MouseUp(MouseUpEvent {
+            position,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        }),
+        cx,
+    );
+}
+
+#[gpui::test]
+fn mouse_stale_frame_draft_cannot_cross_device_or_application(cx: &mut TestAppContext) {
+    let _locale = LOCALE_LOCK.lock().unwrap();
+    rust_i18n::set_locale("en");
+    let (_state, _received) = mouse_state(cx);
+    let (view, cx) = cx.add_window_view(MouseModelView::new);
+    for change_device in [false, true] {
+        cx.update(|_, cx| AppState::apply(cx, |state| state.set_editing_app(None)));
+        open_back_picker(&view, ButtonPress::Short, cx);
+        type_custom_shortcut("Ctrl+P", cx);
+        let row = cx.debug_bounds("custom-shortcut-add").unwrap();
+        let submit = gpui::point(row.right() - px(16.), row.center().y);
+        // Mutate the owner and use the previous frame's mouse listener in one
+        // update; simulate_click would allow an intervening redraw.
+        cx.update(|window, cx| {
+            AppState::apply(cx, |state| {
+                if change_device {
+                    let current = state.selected_device_index().unwrap();
+                    let next = state
+                        .devices()
+                        .iter()
+                        .enumerate()
+                        .find(|(index, record)| {
+                            *index != current
+                                && record.kind == openlogi_core::device::DeviceKind::Mouse
+                                && record.online
+                                && record.route.is_some()
+                        })
+                        .unwrap()
+                        .0;
+                    state.select_device(next)
+                } else {
+                    state.set_editing_app(Some("org.openlogi.stale-frame".into()))
+                }
+            });
+            let before = AppState::try_read(cx).unwrap().button_bindings().clone();
+            click_without_frame(submit, window, cx);
+            assert_eq!(
+                AppState::try_read(cx).unwrap().button_bindings(),
+                &before,
+                "the old draft must not be saved to the newly selected owner"
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+}
+
+#[gpui::test]
+fn mouse_stale_frame_draft_cannot_commit_after_control_or_direction_switch(
+    cx: &mut TestAppContext,
+) {
+    let _locale = LOCALE_LOCK.lock().unwrap();
+    rust_i18n::set_locale("en");
+    let (state, _received) = mouse_state(cx);
+    let (view, cx) = cx.add_window_view(MouseModelView::new);
+    for change_direction in [false, true] {
+        if change_direction {
+            cx.update(|_, cx| {
+                AppState::apply(cx, |state| state.commit_gesture_mode(ButtonId::Back, true));
+            });
+        }
+        open_back_picker(&view, ButtonPress::Short, cx);
+        type_custom_shortcut("Ctrl+P", cx);
+        let row = cx.debug_bounds("custom-shortcut-add").unwrap();
+        let submit = gpui::point(row.right() - px(16.), row.center().y);
+        let before = state.read_with(cx, |state, _| {
+            (
+                state.button_bindings().clone(),
+                state.gesture_bindings().clone(),
+            )
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                if change_direction {
+                    view.set_gesture_selected_dir(Some(GestureDirection::Up));
+                } else {
+                    view.select(MouseControlId::Button(ButtonId::Forward));
+                }
+                cx.notify();
+            });
+            click_without_frame(submit, window, cx);
+        });
+        assert_eq!(
+            state.read_with(cx, |state, _| {
+                (
+                    state.button_bindings().clone(),
+                    state.gesture_bindings().clone(),
+                )
+            }),
+            before
+        );
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+}
+
+#[gpui::test]
+fn mouse_switching_app_device_and_offline_mouse_discards_drafts(cx: &mut TestAppContext) {
+    let _locale = LOCALE_LOCK.lock().unwrap();
+    rust_i18n::set_locale("en");
+    let (state, _received) = mouse_state(cx);
+    let (view, cx) = cx.add_window_view(MouseModelView::new);
+    open_back_picker(&view, ButtonPress::Short, cx);
+    type_custom_shortcut("not-a-key", cx);
+    assert!(cx.debug_bounds("custom-shortcut-error").is_some());
+    cx.update(|_, cx| {
+        AppState::apply(cx, |state| {
+            state.set_editing_app(Some("org.openlogi.review-app".into()))
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(!view.read_with(cx, |view, _| view.action_picker_open));
+    open_back_picker(&view, ButtonPress::Short, cx);
+    assert!(cx.debug_bounds("custom-shortcut-error").is_none());
+
+    // Both another physical online mouse and an offline paired mouse must
+    // reset selection before the old inspector can commit anything.
+    for online in [true, false] {
+        type_custom_shortcut("not-a-key", cx);
+        cx.update(|_, cx| {
+            AppState::apply(cx, |state| {
+                let current = state.current_record().unwrap().device_key();
+                let next = state
+                    .devices()
+                    .iter()
+                    .position(|record| {
+                        record.kind == openlogi_core::device::DeviceKind::Mouse
+                            && record.online == online
+                            && record.device_key() != current
+                    })
+                    .unwrap();
+                state.select_device(next)
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(view.read_with(cx, |view, _| view.selected.is_none()));
+        assert!(!view.read_with(cx, |view, _| view.action_picker_open));
+        open_back_picker(&view, ButtonPress::Short, cx);
+        assert!(cx.debug_bounds("custom-shortcut-error").is_none());
+    }
+    assert!(state.read_with(cx, |state, _| { !state.current_record().unwrap().online }));
+}
+
+#[gpui::test]
+fn mouse_adding_long_press_does_not_silently_break_existing_hold(cx: &mut TestAppContext) {
+    let _locale = LOCALE_LOCK.lock().unwrap();
+    rust_i18n::set_locale("en");
+    let (state, _received) = mouse_state(cx);
+    cx.update(|cx| {
+        AppState::apply(cx, |state| {
+            state.commit_binding(
+                ButtonId::Back,
+                Action::HoldShortcut("Ctrl+A".parse().unwrap()),
+            )
+        });
+    });
+    let (view, cx) = cx.add_window_view(MouseModelView::new);
+    open_back_picker(&view, ButtonPress::Long, cx);
+    type_custom_shortcut("Ctrl+P", cx);
+    submit_custom_shortcut(cx);
+    assert!(
+        !view.read_with(cx, |view, _| view.action_picker_open),
+        "the production save callback ran"
+    );
+    state.read_with(cx, |state, _| {
+        assert_eq!(state.button_bindings().get(&ButtonId::Back), Some(&Action::HoldShortcut("Ctrl+A".parse().unwrap())));
+        assert!(
+            state.long_press_binding(ButtonId::Back).is_none_or(|pair| pair.short().held_combo().is_none()),
+            "a short action fires only at release, so converting Single(Hold) must not preserve an unusable short Hold"
+        );
+    });
+}
+
+#[gpui::test]
+fn hold_binding_explains_why_long_press_is_unavailable(cx: &mut TestAppContext) {
+    let _locale = LOCALE_LOCK.lock().unwrap();
+    rust_i18n::set_locale("en");
+    let (state, _) = mouse_state(cx);
+    cx.update(|cx| {
+        AppState::apply(cx, |state| {
+            state.commit_binding(
+                ButtonId::Back,
+                Action::HoldShortcut("Ctrl+A".parse().unwrap()),
+            )
+        });
+    });
+    let (view, cx) = cx.add_window_view(MouseModelView::new);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select(MouseControlId::Button(ButtonId::Back));
+            cx.notify();
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("hold-conversion-hint").is_some());
+    let tab = cx.debug_bounds("button-long-press").unwrap();
+    cx.simulate_click(tab.center(), gpui::Modifiers::default());
+    assert!(view.read_with(cx, |view, _| view.button_press == ButtonPress::Short));
+    assert!(state.read_with(cx, |state, _| {
+        state.long_press_binding(ButtonId::Back).is_none()
+    }));
 }

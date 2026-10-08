@@ -149,10 +149,14 @@ report an instantaneous button pulse falls back to `short`. `long` may itself
 be a `HoldShortcut`, in which case its chord stays down from the 500 ms
 threshold until the physical release.
 
-Long-press pairs currently apply to global device `bindings` and are authored
-in TOML. The GUI presents their `short` action; changing that button in the GUI
-replaces the whole pair with the selected single action. `per_app_bindings` and
-`keyboard.bindings` remain single-action maps.
+Long-press pairs apply to global device `bindings`. The Buttons inspector edits
+short and long actions independently; changing the short action preserves the
+long action. “Use a single action” removes the long action and restores immediate
+press behavior. `per_app_bindings` and `keyboard.bindings` remain single-action
+maps. Hold requires an action that starts before physical release: an immediate
+single action or the long half of a pair. A short action and a gesture Click
+cannot hold a shortcut. Change an existing Hold to Tap before adding a long
+press or enabling gestures; the editor preserves the existing Hold until then.
 
 An Actions Ring entry wraps the action and may add an icon or literal label:
 

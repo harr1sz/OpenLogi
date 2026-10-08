@@ -1,5 +1,7 @@
 //! Shared action-catalog rows and menu surfaces used by binding editors.
 
+pub(crate) mod custom;
+
 use std::rc::Rc;
 
 use gpui::{

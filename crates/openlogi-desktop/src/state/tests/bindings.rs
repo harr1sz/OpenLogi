@@ -1,6 +1,115 @@
 //! Button, thumb-wheel, gesture and Actions Ring edits, global and per-app.
 
 use super::*;
+use crate::state::BindingEditorKind;
+
+#[test]
+fn editing_short_action_preserves_the_long_action() {
+    use openlogi_core::binding::LongPressBinding;
+
+    let mut state = state_with_a_known_mouse();
+    state.config.edit(|config| {
+        config.set_binding(
+            KNOWN_MOUSE_KEY,
+            ButtonId::Back,
+            Binding::LongPress(LongPressBinding::new(Action::Copy, Action::MissionControl)),
+        );
+    });
+    state.refresh_binding_projections();
+
+    let _ = state.commit_binding(ButtonId::Back, Action::Paste);
+
+    assert_eq!(
+        state
+            .config
+            .stored_bindings(KNOWN_MOUSE_KEY)
+            .get(&ButtonId::Back),
+        Some(&Binding::LongPress(LongPressBinding::new(
+            Action::Paste,
+            Action::MissionControl
+        ))),
+    );
+    assert_eq!(
+        state.button_bindings().get(&ButtonId::Back),
+        Some(&Action::Paste)
+    );
+}
+
+#[test]
+fn long_action_edit_and_removal_preserve_the_short_action() {
+    let mut state = state_with_a_known_mouse();
+    let _ = state.commit_binding(ButtonId::Back, Action::Copy);
+    let _ = state.commit_long_binding(ButtonId::Back, Action::MissionControl);
+    let _ = state.commit_long_binding(ButtonId::Back, Action::ShowDesktop);
+    let pair = state.long_press_binding(ButtonId::Back).unwrap();
+    assert_eq!(pair.short(), &Action::Copy);
+    assert_eq!(pair.long(), &Action::ShowDesktop);
+
+    let _ = state.clear_long_binding(ButtonId::Back);
+    assert_eq!(
+        state
+            .config
+            .stored_bindings(KNOWN_MOUSE_KEY)
+            .get(&ButtonId::Back),
+        Some(&Binding::Single(Action::Copy)),
+    );
+}
+
+#[test]
+fn held_shortcuts_require_explicit_conversion_before_delaying_a_press() {
+    let mut state = state_with_a_known_mouse();
+    let hold = Action::HoldShortcut("Ctrl+A".parse().unwrap());
+    for button in [ButtonId::Back, ButtonId::GestureButton] {
+        let _ = state.commit_gesture_mode(button, false);
+        let _ = state.commit_binding(button, hold.clone());
+        assert!(!state.is_button_press_delayable(button));
+        let before = state.config.stored_bindings(KNOWN_MOUSE_KEY);
+        let _ = state.commit_long_binding(button, Action::Copy);
+        let _ = state.commit_gesture_mode(button, true);
+        assert_eq!(state.config.stored_bindings(KNOWN_MOUSE_KEY), before);
+        assert_eq!(state.button_bindings().get(&button), Some(&hold));
+    }
+
+    let tap = Action::CustomShortcut("Ctrl+A".parse().unwrap());
+    let _ = state.commit_binding(ButtonId::Back, tap.clone());
+    assert!(state.is_button_press_delayable(ButtonId::Back));
+    let _ = state.commit_long_binding(ButtonId::Back, hold.clone());
+    let _ = state.commit_binding(ButtonId::Back, hold.clone());
+    let pair = state.long_press_binding(ButtonId::Back).unwrap();
+    assert_eq!(pair.short(), &tap);
+    assert_eq!(
+        pair.long(),
+        &hold,
+        "a long action may still hold until release"
+    );
+
+    let _ = state.commit_binding(ButtonId::GestureButton, tap.clone());
+    let _ = state.commit_gesture_mode(ButtonId::GestureButton, true);
+    let click =
+        state.gesture_bindings()[&ButtonId::GestureButton][&GestureDirection::Click].clone();
+    let _ = state.commit_gesture_binding(ButtonId::GestureButton, GestureDirection::Click, hold);
+    assert_eq!(
+        state.gesture_bindings()[&ButtonId::GestureButton][&GestureDirection::Click],
+        click,
+    );
+}
+
+#[test]
+fn per_app_edits_cannot_mutate_a_global_long_press_pair() {
+    let mut state = state_with_a_known_mouse();
+    let _ = state.commit_binding(ButtonId::Back, Action::Copy);
+    let _ = state.commit_long_binding(ButtonId::Back, Action::MissionControl);
+    let before = state.config.stored_bindings(KNOWN_MOUSE_KEY);
+    let _ = state.set_editing_app(Some("com.apple.Safari".into()));
+    let _ = state.commit_binding(ButtonId::Back, Action::Paste);
+    let _ = state.commit_long_binding(ButtonId::Back, Action::ShowDesktop);
+    let _ = state.clear_long_binding(ButtonId::Back);
+    assert_eq!(state.config.stored_bindings(KNOWN_MOUSE_KEY), before);
+    assert_eq!(
+        state.button_bindings().get(&ButtonId::Back),
+        Some(&Action::Paste)
+    );
+}
 
 #[test]
 fn thumbwheel_pair_updates_both_memory_and_config_entries() {
@@ -413,4 +522,50 @@ fn gesture_maps_cover_every_gesture_mode_button() {
         maps.contains_key(&ButtonId::Back),
         "a promoted OS-hook button gets its own menu simultaneously"
     );
+}
+
+#[test]
+fn long_press_editor_requires_a_persistent_global_scope() {
+    let mut state = state_with_a_known_mouse();
+    assert!(state.is_long_press_editable());
+    let _ = state.set_editing_app(Some("org.openlogi.test".into()));
+    assert!(!state.is_long_press_editable());
+    let _ = state.set_editing_app(None);
+    let resolver = AssetResolver::new();
+    let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut transient = AppState::new(Sources {
+        inventories: &[direct_inventory([0; 4])],
+        ..Sources::in_memory(Config::ephemeral(), &resolver, commands)
+    });
+    assert!(!transient.is_long_press_editable());
+    let before = transient.button_bindings().clone();
+    let _ = transient.commit_long_binding(ButtonId::Back, Action::Copy);
+    assert_eq!(transient.button_bindings(), &before);
+    assert!(transient.config.devices.is_empty());
+}
+
+#[test]
+fn binding_editor_scope_tracks_each_editors_actual_application() {
+    let mut state = state_with_a_known_mouse();
+    let buttons = state
+        .binding_editor_scope(BindingEditorKind::Buttons)
+        .unwrap();
+    let ring = state
+        .binding_editor_scope(BindingEditorKind::ActionRing)
+        .unwrap();
+    assert!(buttons.is_current(&state));
+    assert!(ring.is_current(&state));
+
+    let _ = state.set_editing_app(Some("org.openlogi.buttons".into()));
+    assert!(!buttons.is_current(&state));
+    assert!(
+        ring.is_current(&state),
+        "the ring has an independent profile"
+    );
+    let buttons = state
+        .binding_editor_scope(BindingEditorKind::Buttons)
+        .unwrap();
+    let _ = state.set_editing_action_ring_app(Some("org.openlogi.ring".into()));
+    assert!(!ring.is_current(&state));
+    assert!(buttons.is_current(&state));
 }

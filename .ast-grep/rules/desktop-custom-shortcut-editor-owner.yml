@@ -1,0 +1,14 @@
+# Owner: features::binding_editor::custom. All custom-action fields share
+# parsing and feedback, so a second picker cannot silently reject a shortcut.
+id: desktop-custom-shortcut-editor-owner
+language: rust
+severity: error
+message: Use binding_editor::custom::CustomActionInputs for custom shortcut entry.
+files:
+  - crates/openlogi-desktop/src/features/**/*.rs
+ignores:
+  - crates/openlogi-desktop/src/features/binding_editor/custom.rs
+rule:
+  any:
+    - pattern: $TEXT.parse::<KeyCombo>()
+    - pattern: $TEXT.parse::<openlogi_core::binding::KeyCombo>()

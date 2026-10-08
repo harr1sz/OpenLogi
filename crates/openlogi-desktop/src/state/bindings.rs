@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use openlogi_core::binding::{Action, Binding, ButtonId, GestureDirection};
+use openlogi_core::binding::{
+    Action, Binding, ButtonId, GestureDirection, LongPressBinding, default_binding,
+};
 use openlogi_core::bindings::{bindings_for, hidpp_gesture_maps_for, oshook_gestures_for};
 use openlogi_core::config::{Config, KeyTrigger};
 use tracing::debug;
@@ -12,6 +14,37 @@ use crate::state::devices::DeviceRecord;
 
 use super::events::StateEvents;
 use super::{AppState, DeviceKey, StateEvent};
+
+/// The two independently scoped binding editors.
+#[derive(Clone, Copy)]
+pub(crate) enum BindingEditorKind {
+    Buttons,
+    ActionRing,
+}
+
+impl BindingEditorKind {
+    fn editing_app(self, state: &AppState) -> Option<&str> {
+        match self {
+            Self::Buttons => state.editing_app(),
+            Self::ActionRing => state.editing_action_ring_app(),
+        }
+    }
+}
+
+/// The device and application that owned a rendered editor command.
+#[derive(Clone)]
+pub(crate) struct BindingEditorScope {
+    device: DeviceKey,
+    app: Option<String>,
+    kind: BindingEditorKind,
+}
+
+impl BindingEditorScope {
+    /// Reject a command retained from a previously selected device or profile.
+    pub(crate) fn is_current(&self, state: &AppState) -> bool {
+        state.is_current_device(&self.device) && self.app.as_deref() == self.kind.editing_app(state)
+    }
+}
 
 /// The per-app profile the binding panels are editing, and the device it was
 /// chosen for, by the persistent config key its profiles are stored under.
@@ -125,6 +158,18 @@ pub(super) fn apply_thumbwheel_pair(
 }
 
 impl AppState {
+    /// Capture the actual editor scope before installing a frame's callbacks.
+    pub(crate) fn binding_editor_scope(
+        &self,
+        kind: BindingEditorKind,
+    ) -> Option<BindingEditorScope> {
+        Some(BindingEditorScope {
+            device: self.current_record()?.device_key(),
+            app: kind.editing_app(self).map(str::to_owned),
+            kind,
+        })
+    }
+
     /// The application whose profile the binding panels are editing, or `None`
     /// for the device's global profile.
     #[must_use]
@@ -172,6 +217,28 @@ impl AppState {
         &self.bindings.keyboard_bindings
     }
 
+    /// Long-press pairs require a stable device identity and the global profile.
+    #[must_use]
+    pub fn is_long_press_editable(&self) -> bool {
+        self.editing_app().is_none()
+            && self
+                .current_record()
+                .and_then(DeviceRecord::persistent_config_key)
+                .is_some()
+    }
+
+    /// The selected button's global short/long pair, when this scope supports it.
+    pub fn long_press_binding(&self, button: ButtonId) -> Option<&LongPressBinding> {
+        if self.editing_app().is_some() {
+            return None;
+        }
+        let key = self.current_record()?.persistent_config_key()?;
+        match self.config.devices.get(key)?.bindings.get(&button)? {
+            Binding::LongPress(pair) => Some(pair),
+            Binding::Single(_) | Binding::Gesture(_) => None,
+        }
+    }
+
     pub(super) fn refresh_binding_projections(&mut self) {
         let key = self
             .current_record()
@@ -195,6 +262,9 @@ impl AppState {
     /// Disk failures restore the persisted projection and surface a config
     /// error instead of crashing the UI thread.
     pub fn commit_binding(&mut self, button: ButtonId, action: Action) -> StateEvents {
+        if action.held_combo().is_some() && self.long_press_binding(button).is_some() {
+            return StateEvents::none();
+        }
         let events = self.for_current_device(StateEvent::BindingsChanged);
         self.bindings.button_bindings.insert(button, action.clone());
 
@@ -210,16 +280,84 @@ impl AppState {
             return events;
         };
         let app = self.editing_app().map(str::to_string);
-        self.config.edit(|config| match app {
-            // A per-app entry is `Action`-valued, so an override always
-            // replaces the whole button — which is exactly what picking one
-            // action means, and why gesture mode is not offered in this scope.
-            Some(app) => config.set_per_app_binding(&key, &app, button, Some(action)),
-            None => config.set_binding(&key, button, Binding::Single(action)),
+        self.config.edit(|config| {
+            if let Some(app) = app {
+                // A per-app entry is `Action`-valued, so an override always
+                // replaces the whole button — which is exactly what picking one
+                // action means, and why gesture mode is not offered in this scope.
+                config.set_per_app_binding(&key, &app, button, Some(action));
+            } else {
+                let binding = match config
+                    .devices
+                    .get(&key)
+                    .and_then(|device| device.bindings.get(&button))
+                {
+                    Some(Binding::LongPress(pair)) => {
+                        Binding::LongPress(LongPressBinding::new(action, pair.long().clone()))
+                    }
+                    _ => Binding::Single(action),
+                };
+                config.set_binding(&key, button, binding);
+            }
         });
         // The agent owns the hook; have it rebuild its live map from config.
         self.persist_and_reload("binding");
         events
+    }
+
+    /// Whether delaying this button until release preserves its current action.
+    #[must_use]
+    pub fn is_button_press_delayable(&self, button: ButtonId) -> bool {
+        self.bindings
+            .button_bindings
+            .get(&button)
+            .is_none_or(|action| action.held_combo().is_none())
+    }
+
+    /// Set the long action without changing the short action. App overlays
+    /// remain single-action maps; they cannot create hidden global edits.
+    pub fn commit_long_binding(&mut self, button: ButtonId, action: Action) -> StateEvents {
+        if self.bindings.gesture_bindings.contains_key(&button)
+            || !self.is_button_press_delayable(button)
+        {
+            return StateEvents::none();
+        }
+        let short = self
+            .bindings
+            .button_bindings
+            .get(&button)
+            .cloned()
+            .unwrap_or_else(|| default_binding(button));
+        self.commit_global_binding(
+            button,
+            Binding::LongPress(LongPressBinding::new(short, action)),
+        )
+    }
+
+    /// Explicitly return to immediate single-action behavior, keeping short.
+    pub fn clear_long_binding(&mut self, button: ButtonId) -> StateEvents {
+        let Some(pair) = self.long_press_binding(button) else {
+            return StateEvents::none();
+        };
+        self.commit_global_binding(button, Binding::Single(pair.short().clone()))
+    }
+
+    fn commit_global_binding(&mut self, button: ButtonId, binding: Binding) -> StateEvents {
+        if self.editing_app().is_some() {
+            return StateEvents::none();
+        }
+        let Some(key) = self
+            .current_record()
+            .and_then(DeviceRecord::persistent_config_key)
+            .map(str::to_owned)
+        else {
+            return StateEvents::none();
+        };
+        self.config
+            .edit(|config| config.set_binding(&key, button, binding));
+        self.refresh_binding_projections();
+        self.persist_and_reload("binding");
+        self.for_current_device(StateEvent::BindingsChanged)
     }
 
     /// Drop `button`'s override in the open per-app profile, so it inherits the
@@ -430,6 +568,9 @@ impl AppState {
     /// independently of every other button. Persists, tells the agent to
     /// rebuild, and refreshes the projected maps the UI reads.
     pub fn commit_gesture_mode(&mut self, button: ButtonId, enabled: bool) -> StateEvents {
+        if enabled && !self.is_button_press_delayable(button) {
+            return StateEvents::none();
+        }
         let events = self.for_current_device(StateEvent::BindingsChanged);
         if enabled && !button.supports_gesture_mode() {
             debug!(?button, "gesture mode is not supported for this control");
@@ -480,6 +621,9 @@ impl AppState {
         direction: GestureDirection,
         action: Action,
     ) -> StateEvents {
+        if direction == GestureDirection::Click && action.held_combo().is_some() {
+            return StateEvents::none();
+        }
         let events = self.for_current_device(StateEvent::BindingsChanged);
         let Some(key) = self
             .current_record()

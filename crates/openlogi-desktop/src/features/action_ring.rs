@@ -2,16 +2,17 @@
 
 mod action_icons;
 mod editor;
+#[cfg(test)]
+mod tests;
 
 use gpui::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled,
-    Subscription, Window, div, prelude::FluentBuilder as _, px, rgb, svg,
+    App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
+    Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Subscription, Window, div,
+    prelude::FluentBuilder as _, px, rgb, svg,
 };
 use gpui_base::Button as BaseButton;
 use gpui_component::{
-    Icon, IconName, Selectable as _, button::Button, h_flex, input::InputState, tooltip::Tooltip,
-    v_flex,
+    Icon, IconName, Selectable as _, button::Button, h_flex, tooltip::Tooltip, v_flex,
 };
 use openlogi_core::binding::{
     ActionRingConfig, ActionRingEntry, ActionRingIcon, ActionRingLayout, ActionRingSlot,
@@ -20,7 +21,11 @@ use openlogi_ui::action_icons::RING_CANCEL_ICON;
 
 use self::action_icons::action_icon_path;
 use self::editor::action_library;
-use crate::state::{AppState, StateEvent, StateEvents};
+use crate::features::binding_editor::custom::CustomActionInputs;
+use crate::state::{
+    AppState, BindingEditorKind, BindingEditorScope, DeviceKey, DeviceRecord, StateEvent,
+    StateEvents,
+};
 use crate::ui::action::localized_action_label;
 use crate::ui::theme::{self, Palette, Typography as _};
 
@@ -29,11 +34,29 @@ use crate::ui::theme::{self, Palette, Typography as _};
 pub struct ActionRingPanel {
     focus_handle: FocusHandle,
     selected_slot: ActionRingSlot,
-    application_input: Option<Entity<InputState>>,
-    shortcut_input: Option<Entity<InputState>>,
+    custom_inputs: Option<CustomActionInputs>,
+    current_device_key: Option<DeviceKey>,
+    editing_scope: Option<String>,
     library_scroll: ScrollHandle,
     #[expect(dead_code, reason = "held to keep the AppState subscription alive")]
     state_obs: Subscription,
+}
+
+/// The scope and slot that owned one frame's ring editor commands.
+#[derive(Clone)]
+struct RingEditorTarget {
+    scope: Option<BindingEditorScope>,
+    slot: ActionRingSlot,
+    view: Entity<ActionRingPanel>,
+}
+
+impl RingEditorTarget {
+    fn is_current(&self, cx: &App) -> bool {
+        self.view.read(cx).selected_slot == self.slot
+            && self.scope.as_ref().is_some_and(|scope| {
+                AppState::try_read(cx).is_some_and(|state| scope.is_current(state))
+            })
+    }
 }
 
 impl ActionRingPanel {
@@ -44,11 +67,34 @@ impl ActionRingPanel {
         Self {
             focus_handle: cx.focus_handle(),
             selected_slot: ActionRingSlot::Top,
-            application_input: None,
-            shortcut_input: None,
+            custom_inputs: None,
+            current_device_key: None,
+            editing_scope: None,
             library_scroll: ScrollHandle::new(),
             state_obs,
         }
+    }
+
+    fn sync_custom_inputs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> CustomActionInputs {
+        let inputs = self
+            .custom_inputs
+            .get_or_insert_with(|| CustomActionInputs::new(window, cx))
+            .clone();
+        let device_key = AppState::try_read(cx)
+            .and_then(|state| state.current_record().map(DeviceRecord::device_key));
+        let scope = AppState::try_read(cx)
+            .and_then(|state| state.editing_action_ring_app().map(str::to_owned));
+        if self.current_device_key != device_key || self.editing_scope != scope {
+            inputs.clear(window, cx);
+            self.current_device_key = device_key;
+            self.editing_scope = scope;
+        }
+        inputs.localize(window, cx);
+        inputs
     }
 }
 
@@ -63,19 +109,14 @@ impl Render for ActionRingPanel {
         let pal = theme::palette(cx);
         let (ring, layout) = action_ring_editor_state(cx);
         let haptics_supported = current_device_supports_haptics(cx);
-        let application_input = editor_input(
-            &mut self.application_input,
-            tr!("action_ring.application_folder_path_or_url"),
-            window,
-            cx,
-        );
-        let shortcut_input = editor_input(
-            &mut self.shortcut_input,
-            tr!("action_ring.shortcut_e_g_cmd_plus_shift_plus_p"),
-            window,
-            cx,
-        );
+        let inputs = self.sync_custom_inputs(window, cx);
         let view = cx.entity();
+        let target = RingEditorTarget {
+            scope: AppState::try_read(cx)
+                .and_then(|state| state.binding_editor_scope(BindingEditorKind::ActionRing)),
+            slot: self.selected_slot,
+            view: view.clone(),
+        };
 
         v_flex()
             .w_full()
@@ -105,12 +146,12 @@ impl Render for ActionRingPanel {
                     .gap_4()
                     .child(ring_preview(&layout, self.selected_slot, &view, pal))
                     .child(action_library(
-                        self.selected_slot,
+                        &target,
                         layout.slots.get(&self.selected_slot),
-                        &application_input,
-                        &shortcut_input,
+                        &inputs,
                         &self.library_scroll,
                         pal,
+                        cx,
                     )),
             )
             .child(
@@ -131,6 +172,8 @@ impl Render for ActionRingPanel {
                     .child(toggle_button(
                         "ring-enabled",
                         ring.enabled,
+                        target.scope.as_ref(),
+                        |state| state.current_action_ring().enabled,
                         AppState::commit_action_ring_enabled,
                     )),
             )
@@ -153,6 +196,8 @@ impl Render for ActionRingPanel {
                         .child(toggle_button(
                             "ring-haptics",
                             ring.haptics,
+                            target.scope.as_ref(),
+                            |state| state.current_action_ring().haptics,
                             AppState::commit_action_ring_haptics,
                         )),
                 )
@@ -175,24 +220,6 @@ fn action_ring_editor_state(cx: &Context<ActionRingPanel>) -> (ActionRingConfig,
     )
 }
 
-fn editor_input(
-    state: &mut Option<Entity<InputState>>,
-    placeholder: impl Into<SharedString>,
-    window: &mut Window,
-    cx: &mut Context<ActionRingPanel>,
-) -> Entity<InputState> {
-    let placeholder = placeholder.into();
-    let state = state
-        .get_or_insert_with(|| {
-            cx.new(|cx| InputState::new(window, cx).placeholder(placeholder.clone()))
-        })
-        .clone();
-    // Callers pass a per-render `tr!` string, so a cached input follows a live
-    // language switch instead of keeping the placeholder it was built with.
-    crate::ui::components::localize_placeholder(&state, placeholder, window, cx);
-    state
-}
-
 fn current_device_supports_haptics(cx: &Context<ActionRingPanel>) -> bool {
     AppState::try_read(cx).is_some_and(|state| {
         state.current_record().is_some_and(|record| {
@@ -209,17 +236,33 @@ fn current_device_supports_haptics(cx: &Context<ActionRingPanel>) -> bool {
 fn toggle_button(
     id: &'static str,
     enabled: bool,
+    scope: Option<&BindingEditorScope>,
+    read: impl Fn(&AppState) -> bool + 'static,
     commit: impl Fn(&mut AppState, bool) -> StateEvents + 'static,
-) -> Button {
-    Button::new(id)
-        .compact()
-        .label(if enabled {
-            tr!("common.on")
-        } else {
-            tr!("common.off")
-        })
-        .selected(enabled)
-        .on_click(move |_, _, cx| AppState::apply(cx, |state| commit(state, !enabled)))
+) -> impl IntoElement {
+    let scope = scope.cloned();
+    div()
+        .debug_selector(move || id.to_string())
+        .flex_none()
+        .child(
+            Button::new(id)
+                .compact()
+                .label(if enabled {
+                    tr!("common.on")
+                } else {
+                    tr!("common.off")
+                })
+                .selected(enabled)
+                .on_click(move |_, _, cx| {
+                    AppState::apply(cx, |state| {
+                        if !scope.as_ref().is_some_and(|scope| scope.is_current(state)) {
+                            return StateEvents::none();
+                        }
+                        let enabled = read(state);
+                        commit(state, !enabled)
+                    });
+                }),
+        )
 }
 
 const PREVIEW_SIZE: f32 = 320.0;
@@ -295,6 +338,7 @@ fn slot_button(
     let selected_view = view.clone();
 
     BaseButton::new(("action-ring-slot", index))
+        .debug_selector(move || format!("action-ring-slot-{index}"))
         .selected(selected)
         .absolute()
         .left(px(left))
@@ -349,8 +393,13 @@ fn slot_button(
                     pal.control_hover
                 })
         })
-        .on_click(move |_, _, cx| {
+        .on_click(move |_, window, cx| {
             selected_view.update(cx, |panel, cx| {
+                if panel.selected_slot != slot
+                    && let Some(inputs) = &panel.custom_inputs
+                {
+                    inputs.clear(window, cx);
+                }
                 panel.selected_slot = slot;
                 cx.notify();
             });

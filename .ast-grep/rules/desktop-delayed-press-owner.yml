@@ -1,0 +1,11 @@
+# Owner: AppState decides whether changing the press lifetime preserves a Hold.
+id: desktop-delayed-press-owner
+language: rust
+severity: error
+message: Use AppState::is_button_press_delayable; delayed-press eligibility belongs to state/bindings.rs.
+files:
+  - crates/openlogi-desktop/src/features/**/*.rs
+ignores:
+  - crates/openlogi-desktop/src/features/**/tests.rs
+rule:
+  pattern: $ACTION.held_combo()

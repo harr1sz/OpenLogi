@@ -11,21 +11,25 @@ use gpui_base::Button as BaseButton;
 use gpui_component::{
     h_flex,
     input::{InputEvent, InputState},
+    scroll::ScrollableElement as _,
     v_flex,
 };
 use openlogi_core::binding::{Action, ButtonId, GestureDirection};
 
 use super::geometry::{
     LabelDistribution, asset_dimensions_for_png, asset_has_button_labels, asset_hotspots_for_png,
-    default_labels, labels_from_hotspots,
+    labels_from_hotspots,
 };
 use super::hotspots::{Hotspot, MOUSE_MODEL_SIZE, MouseControlId, default_hotspots};
 use super::inspector::{BindingInspectorData, binding_inspector};
 use super::leader_lines::{Geometry as LeaderGeometry, Label, paint as paint_leader_lines};
 use crate::app::{glow_canvas, keyboard_glow};
+use crate::features::binding_editor::custom::{CustomActionInputs, ShortcutMode};
 use crate::features::profiles::{friendly_app_name, profile_canvas_status};
 use crate::services::assets::{GlowGeometry, ResolvedAsset};
-use crate::state::{AppState, DeviceKey, DeviceRecord, StateEvent};
+use crate::state::{
+    AppState, BindingEditorKind, BindingEditorScope, DeviceKey, DeviceRecord, StateEvent,
+};
 use crate::ui::theme::{self, ACCENT_BLUE};
 
 const SIDE_GAP: f32 = 24.;
@@ -42,9 +46,8 @@ const MODEL_VERTICAL_RESERVE: f32 = 154.;
 
 mod labels;
 use labels::{binding_label_for_control, label_control};
-/// Floor for the scaled model height. Below this the evenly-slotted side labels
-/// (≈[`LABEL_H`](super::geometry::LABEL_H) each) start to overlap; the window's minimum height is sized to
-/// keep the viewport above [`MODEL_VERTICAL_RESERVE`] + this.
+/// Floor for the scaled model height. Label cards can make the scrollable
+/// canvas taller when a narrow window constrains the image width.
 const MODEL_MIN_H: f32 = 360.;
 
 /// Max width the model (side gutter + image) may occupy, matching the
@@ -120,6 +123,38 @@ impl<'a> MouseWorkspaceData<'a> {
     }
 }
 
+/// The two mutually exclusive outcomes of a physical button press.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ButtonPress {
+    #[default]
+    Short,
+    Long,
+}
+
+/// The scope and control that owned an inspector's rendered callbacks.
+#[derive(Clone)]
+pub(super) struct MouseEditorTarget {
+    scope: Option<BindingEditorScope>,
+    control: Option<MouseControlId>,
+    direction: Option<GestureDirection>,
+    press: ButtonPress,
+    picker_open: bool,
+}
+
+impl MouseEditorTarget {
+    /// A pending mouse callback may outlive the frame that selected its owner.
+    pub(super) fn is_current(&self, view: &Entity<MouseModelView>, cx: &App) -> bool {
+        let view = view.read(cx);
+        self.control == view.selected
+            && self.direction == view.gesture_active_dir
+            && self.press == view.button_press
+            && self.picker_open == view.action_picker_open
+            && self.scope.as_ref().is_some_and(|scope| {
+                AppState::try_read(cx).is_some_and(|state| scope.is_current(state))
+            })
+    }
+}
+
 /// Interactive mouse model with button hotspots.
 pub struct MouseModelView {
     focus_handle: FocusHandle,
@@ -130,16 +165,25 @@ pub struct MouseModelView {
     gesture_active_dir: Option<GestureDirection>,
     action_picker_open: bool,
     action_search: Entity<InputState>,
-    pub(super) custom_shortcut_input: Entity<InputState>,
-    pub(super) custom_application_input: Entity<InputState>,
-    /// Whether the last "Add" attempt on the corresponding custom editor
-    /// failed to parse, so its caption can show an inline error.
-    pub(super) custom_shortcut_invalid: bool,
-    pub(super) custom_application_invalid: bool,
+    pub(super) custom_inputs: CustomActionInputs,
+    pub(super) shortcut_mode: ShortcutMode,
+    pub(super) button_press: ButtonPress,
+    editing_scope: Option<String>,
     _state_obs: Subscription,
 }
 
 impl MouseModelView {
+    fn editor_target(&self, cx: &App) -> MouseEditorTarget {
+        MouseEditorTarget {
+            scope: AppState::try_read(cx)
+                .and_then(|state| state.binding_editor_scope(BindingEditorKind::Buttons)),
+            control: self.selected,
+            direction: self.gesture_active_dir,
+            press: self.button_press,
+            picker_open: self.action_picker_open,
+        }
+    }
+
     /// Create the mouse model view.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let action_search =
@@ -149,31 +193,6 @@ impl MouseModelView {
                 cx.notify();
             }
         })
-        .detach();
-        let custom_shortcut_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(tr!("action_ring.shortcut_e_g_cmd_plus_shift_plus_p"))
-        });
-        cx.subscribe(&custom_shortcut_input, |view, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                view.custom_shortcut_invalid = false;
-                cx.notify();
-            }
-        })
-        .detach();
-        let custom_application_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(tr!("action_ring.application_folder_path_or_url"))
-        });
-        cx.subscribe(
-            &custom_application_input,
-            |view, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    view.custom_application_invalid = false;
-                    cx.notify();
-                }
-            },
-        )
         .detach();
         let state_obs = AppState::repaint_on(cx, |event| {
             matches!(
@@ -191,28 +210,44 @@ impl MouseModelView {
             gesture_active_dir: None,
             action_picker_open: false,
             action_search,
-            custom_shortcut_input,
-            custom_application_input,
-            custom_shortcut_invalid: false,
-            custom_application_invalid: false,
+            custom_inputs: CustomActionInputs::new(window, cx),
+            shortcut_mode: ShortcutMode::Tap,
+            button_press: ButtonPress::Short,
+            editing_scope: None,
             _state_obs: state_obs,
         }
     }
 
-    /// Clear both custom-action drafts (text and any invalid state) — called
-    /// whenever the picker opens for a new target, so a shortcut or
-    /// application typed for one button doesn't reappear for another.
-    pub(super) fn clear_custom_action_drafts(
+    fn close_picker_on_escape(
         &mut self,
+        event: &gpui::KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.custom_shortcut_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        self.custom_application_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        self.custom_shortcut_invalid = false;
-        self.custom_application_invalid = false;
+        if event.keystroke.key == "escape" && self.action_picker_open {
+            self.close_action_picker();
+            self.custom_inputs.clear(window, cx);
+            self.focus_handle.focus(window, cx);
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn sync_editor_scope(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::ui::components::localize_placeholder(
+            &self.action_search,
+            tr!("actions.search_actions"),
+            window,
+            cx,
+        );
+        self.custom_inputs.localize(window, cx);
+        let scope = AppState::try_read(cx).and_then(|state| state.editing_app().map(str::to_owned));
+        if self.editing_scope != scope {
+            self.editing_scope = scope;
+            self.button_press = ButtonPress::Short;
+            self.close_action_picker();
+            self.custom_inputs.clear(window, cx);
+        }
     }
 
     /// Set (or clear, with `None`) the activated gesture direction. Callers must
@@ -222,7 +257,11 @@ impl MouseModelView {
         self.action_picker_open = false;
     }
 
-    pub(super) fn toggle_action_picker(&mut self) {
+    pub(super) fn toggle_action_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.action_picker_open {
+            self.custom_inputs.clear(window, cx);
+            self.shortcut_mode = ShortcutMode::Tap;
+        }
         self.action_picker_open = !self.action_picker_open;
     }
 
@@ -238,6 +277,7 @@ impl MouseModelView {
         self.hovered = None;
         self.selected = None;
         self.gesture_active_dir = None;
+        self.button_press = ButtonPress::Short;
         self.action_picker_open = false;
     }
 
@@ -245,6 +285,7 @@ impl MouseModelView {
         if self.selected != Some(control) {
             self.selected = Some(control);
             self.gesture_active_dir = None;
+            self.button_press = ButtonPress::Short;
             self.action_picker_open = false;
         }
     }
@@ -272,34 +313,10 @@ fn set_control_hovered(
     });
 }
 
-impl MouseModelView {
-    /// Re-stamp every action-picker input's placeholder after a language
-    /// switch, split out of `render` to keep it under clippy's line budget.
-    fn localize_action_picker_inputs(&self, window: &mut Window, cx: &mut Context<Self>) {
-        crate::ui::components::localize_placeholder(
-            &self.action_search,
-            tr!("actions.search_actions"),
-            window,
-            cx,
-        );
-        crate::ui::components::localize_placeholder(
-            &self.custom_shortcut_input,
-            tr!("action_ring.shortcut_e_g_cmd_plus_shift_plus_p"),
-            window,
-            cx,
-        );
-        crate::ui::components::localize_placeholder(
-            &self.custom_application_input,
-            tr!("action_ring.application_folder_path_or_url"),
-            window,
-            cx,
-        );
-    }
-}
-
 impl Render for MouseModelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.localize_action_picker_inputs(window, cx);
+        self.sync_editor_scope(window, cx);
+
         let (empty_bindings, empty_gesture_maps) = (BTreeMap::new(), BTreeMap::new());
         let MouseWorkspaceData {
             device_key,
@@ -330,14 +347,13 @@ impl Render for MouseModelView {
         let viewport_w = f32::from(window.viewport_size().width);
         let ModelLayout {
             canvas_w,
+            canvas_h,
             mouse_left,
             mouse_w,
             mouse_h,
             hotspots,
             labels,
         } = model_layout(asset, viewport_w, viewport_h, thumbwheel);
-        let canvas_h = mouse_h;
-
         let highlight = self.hovered.or(active).or(self.selected);
         let view = cx.entity();
         let hovered = self.hovered;
@@ -380,11 +396,16 @@ impl Render for MouseModelView {
             }))
             .child(hotspots_layer);
 
+        let editor_target = self.editor_target(cx);
         let inspector = binding_inspector(
             BindingInspectorData {
+                target: &editor_target,
                 selected: self.selected,
                 gesture_direction: self.gesture_active_dir,
                 action_picker_open: self.action_picker_open,
+                button_press: self.button_press,
+                shortcut_mode: self.shortcut_mode,
+                custom_inputs: &self.custom_inputs,
                 bindings,
                 gesture_maps,
                 dpi_gestures,
@@ -396,6 +417,7 @@ impl Render for MouseModelView {
             cx,
         );
         workspace_layout(canvas, profile_status, inspector, &self.focus_handle)
+            .on_key_down(cx.listener(Self::close_picker_on_escape))
     }
 }
 
@@ -404,9 +426,10 @@ fn workspace_layout(
     profile_status: Option<gpui::Div>,
     inspector: impl IntoElement,
     focus_handle: &FocusHandle,
-) -> impl IntoElement {
+) -> gpui::Div {
     h_flex()
         .flex_1()
+        .min_w_0()
         .min_h_0()
         .w_full()
         .items_stretch()
@@ -421,15 +444,21 @@ fn workspace_layout(
                 .children(profile_status)
                 .child(
                     div()
+                        .id("mouse-model-scroll")
                         .flex_1()
                         .min_h_0()
                         .w_full()
-                        .overflow_hidden()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .p_4()
-                        .child(canvas),
+                        .overflow_y_scrollbar()
+                        .child(
+                            div()
+                                .min_h_full()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .p_4()
+                                .child(canvas),
+                        ),
                 ),
         )
         .child(inspector)
@@ -437,6 +466,7 @@ fn workspace_layout(
 
 struct ModelLayout {
     canvas_w: f32,
+    canvas_h: f32,
     mouse_left: f32,
     mouse_w: f32,
     mouse_h: f32,
@@ -477,6 +507,9 @@ fn model_layout(
 
     ModelLayout {
         canvas_w: left_gutter + mouse_w + right_gutter,
+        canvas_h: labels.iter().fold(mouse_h, |height, label| {
+            height.max(label.y + super::geometry::LABEL_H / 2.)
+        }),
         mouse_left: left_gutter,
         mouse_w,
         mouse_h,
@@ -503,7 +536,7 @@ fn scaled_model(
         (w, h, hotspots, labels)
     } else {
         let scale = (target_h / MOUSE_MODEL_SIZE.1).min(max_w / MOUSE_MODEL_SIZE.0);
-        let hotspots = default_hotspots(thumbwheel)
+        let hotspots: Vec<_> = default_hotspots(thumbwheel)
             .into_iter()
             .map(|hs| Hotspot {
                 x: hs.x * scale,
@@ -513,13 +546,8 @@ fn scaled_model(
                 ..hs
             })
             .collect();
-        let labels = default_labels(thumbwheel, label_distribution)
-            .into_iter()
-            .map(|l| Label {
-                y: l.y * scale,
-                ..l
-            })
-            .collect();
+        let labels =
+            labels_from_hotspots(&hotspots, MOUSE_MODEL_SIZE.1 * scale, label_distribution);
         (
             MOUSE_MODEL_SIZE.0 * scale,
             MOUSE_MODEL_SIZE.1 * scale,

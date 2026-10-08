@@ -187,7 +187,10 @@ pub fn labels_from_hotspots(
         } else {
             None
         };
-        let step = mouse_h / (vertical_order.len() as f32 + 1.);
+        // The image can shrink with the window, but its controls retain their
+        // readable height. The canvas scrolls when those cards need more room.
+        let step =
+            (mouse_h / (vertical_order.len() as f32 + 1.)).max(LABEL_H + NAVIGATION_GROUP_GAP);
         for (slot, index) in vertical_order.into_iter().enumerate() {
             labels[index].y = step * (slot as f32 + 1.);
         }
@@ -200,15 +203,6 @@ pub fn labels_from_hotspots(
     }
 
     labels
-}
-
-/// Label positions for the synthetic fallback silhouette.
-pub fn default_labels(thumbwheel: bool, distribution: LabelDistribution) -> Vec<Label> {
-    labels_from_hotspots(
-        &super::hotspots::default_hotspots(thumbwheel),
-        MOUSE_MODEL_SIZE.1,
-        distribution,
-    )
 }
 
 /// Logitech's stable slot vocabulary → OpenLogi's visual control IDs. Intentionally
@@ -250,13 +244,20 @@ mod tests {
 
     #[test]
     fn default_labels_include_capability_gated_thumbwheel() {
+        let labels = |thumbwheel| {
+            labels_from_hotspots(
+                &super::super::hotspots::default_hotspots(thumbwheel),
+                MOUSE_MODEL_SIZE.1,
+                LabelDistribution::LeftOnly,
+            )
+        };
         assert!(
-            !default_labels(false, LabelDistribution::LeftOnly)
+            !labels(false)
                 .iter()
                 .any(|label| label.id == MouseControlId::ThumbwheelRotation)
         );
         assert_eq!(
-            default_labels(true, LabelDistribution::LeftOnly)
+            labels(true)
                 .iter()
                 .filter(|label| label.id == MouseControlId::ThumbwheelRotation)
                 .count(),

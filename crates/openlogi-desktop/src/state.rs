@@ -23,6 +23,7 @@ use openlogi_core::hid::{Dpi, SmartShiftStatus};
 use tokio::sync::mpsc;
 use tracing::warn;
 
+pub(crate) use bindings::{BindingEditorKind, BindingEditorScope};
 pub use config::ConfigPersistence;
 pub(crate) use device_key::DeviceKey;
 pub use devices::DeviceRecord;

@@ -1,5 +1,11 @@
 //! Debug-only gallery for reviewing shared controls without app runtime state.
 
+use std::rc::Rc;
+
+use crate::features::binding_editor::{
+    PickFn,
+    custom::{CustomActionInputs, ShortcutMode, ShortcutModes},
+};
 use gpui::{
     App, AppContext as _, Bounds, Context, InteractiveElement, IntoElement, ParentElement, Render,
     Role, SharedString, Size, Styled, Window, WindowBounds, WindowOptions, div, px, rems,
@@ -98,6 +104,9 @@ struct ComponentGallery {
     carousel_selected: usize,
     slider: CommitSlider<u8>,
     slider_committed: u8,
+    custom_inputs: Option<CustomActionInputs>,
+    shortcut_mode: ShortcutMode,
+    picked_action: Option<openlogi_core::binding::Action>,
 }
 
 impl ComponentGallery {
@@ -120,6 +129,9 @@ impl ComponentGallery {
             carousel_selected: 1,
             slider,
             slider_committed,
+            custom_inputs: None,
+            shortcut_mode: ShortcutMode::Tap,
+            picked_action: None,
         }
     }
 
@@ -188,6 +200,44 @@ impl ComponentGallery {
             )
     }
 
+    fn custom_panel(&self, pal: Palette, cx: &Context<Self>) -> Option<gpui::Div> {
+        let inputs = self.custom_inputs.as_ref()?;
+        let view = cx.entity();
+        let picked = view.clone();
+        let commit_inputs = inputs.clone();
+        let on_pick: PickFn = Rc::new(move |action, window, cx| {
+            commit_inputs.clear(window, cx);
+            picked.update(cx, |view, cx| {
+                view.picked_action = Some(action);
+                cx.notify();
+            });
+        });
+        let mode_owner = view.clone();
+        let modes = ShortcutModes {
+            selected: self.shortcut_mode,
+            read: Rc::new(move |cx| mode_owner.read(cx).shortcut_mode),
+            on_change: Rc::new(move |mode, cx| {
+                view.update(cx, |view, cx| {
+                    view.shortcut_mode = mode;
+                    cx.notify();
+                });
+            }),
+        };
+        Some(gallery_panel(
+            "Custom action editor",
+            IconName::Cpu,
+            v_flex()
+                .gap_2()
+                .child(inputs.render(Some(modes), &on_pick, pal, cx))
+                .children(self.picked_action.as_ref().map(|action| {
+                    div()
+                        .text_caption()
+                        .child(crate::ui::action::localized_action_label(action))
+                })),
+            pal,
+        ))
+    }
+
     fn controls(&self, pal: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .w_full()
@@ -201,6 +251,7 @@ impl ComponentGallery {
             .child(self.preset_panel(pal, cx))
             .child(self.slider_panel(pal))
             .child(Self::battery_panel(pal))
+            .children(self.custom_panel(pal, cx))
     }
 
     fn choice_panel(&self, pal: Palette, cx: &mut Context<Self>) -> gpui::Div {
@@ -472,6 +523,10 @@ impl ComponentGallery {
 impl Render for ComponentGallery {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         theme::apply_scale(window, self.scale);
+        let inputs = self
+            .custom_inputs
+            .get_or_insert_with(|| CustomActionInputs::new(window, cx));
+        inputs.localize(window, cx);
         let pal = theme::palette(cx);
         v_flex()
             .size_full()

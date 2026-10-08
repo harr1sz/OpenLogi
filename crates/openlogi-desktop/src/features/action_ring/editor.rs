@@ -1,33 +1,44 @@
 //! Categorized action, shortcut, path, and icon editor for one ring slot.
 
+use std::rc::Rc;
+
 use gpui::{
-    Entity, InteractiveElement, IntoElement, ParentElement, Role, ScrollHandle,
+    App, InteractiveElement, IntoElement, ParentElement, Role, ScrollHandle,
     StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px, rgb, svg,
 };
 use gpui_component::{
-    Icon, IconName, Selectable as _, button::Button, h_flex, input::InputState,
-    scroll::ScrollableElement as _, v_flex,
+    Icon, IconName, Selectable as _, button::Button, h_flex, scroll::ScrollableElement as _, v_flex,
 };
-use openlogi_core::binding::{
-    Action, ActionRingEntry, ActionRingIcon, ActionRingSlot, ApplicationTarget, Category, KeyCombo,
-    RingAction,
-};
+use openlogi_core::binding::{Action, ActionRingEntry, ActionRingIcon, Category, RingAction};
 
+use super::RingEditorTarget;
 use super::action_icons::action_icon_path;
-use crate::features::binding_editor::editor_section;
+use crate::features::binding_editor::custom::CustomActionInputs;
+use crate::features::binding_editor::{PickFn, editor_section};
 use crate::state::AppState;
 use crate::ui::action::localized_action_label;
-use crate::ui::components::{MenuRow, control_input};
+use crate::ui::components::MenuRow;
 use crate::ui::theme::{self, Palette, Typography as _};
 
 pub(super) fn action_library(
-    slot: ActionRingSlot,
+    target: &RingEditorTarget,
     current: Option<&ActionRingEntry>,
-    application_input: &Entity<InputState>,
-    shortcut_input: &Entity<InputState>,
+    inputs: &CustomActionInputs,
     library_scroll: &ScrollHandle,
     pal: Palette,
+    cx: &App,
 ) -> impl IntoElement {
+    let clear_inputs = inputs.clone();
+    let commit_inputs = inputs.clone();
+    let commit_target = target.clone();
+    let clear_target = target.clone();
+    let on_pick: PickFn = Rc::new(move |action, window, cx| {
+        if !commit_target.is_current(cx) {
+            return;
+        }
+        commit_inputs.clear(window, cx);
+        commit_action(&commit_target, action, cx);
+    });
     let current_action = current.map(ActionRingEntry::action).cloned();
     let current_label = current_action
         .as_ref()
@@ -60,10 +71,18 @@ pub(super) fn action_library(
                                 .child(tr!("action_ring.actions_ring")),
                         )
                         .child(
-                            Button::new("ring-clear-slot")
-                                .compact()
-                                .label(tr!("action_ring.clear_slot"))
-                                .on_click(move |_, _, cx| commit_slot(slot, None, cx)),
+                            div().debug_selector(|| "ring-clear-slot".into()).child(
+                                Button::new("ring-clear-slot")
+                                    .compact()
+                                    .label(tr!("action_ring.clear_slot"))
+                                    .on_click(move |_, window, cx| {
+                                        if !clear_target.is_current(cx) {
+                                            return;
+                                        }
+                                        clear_inputs.clear(window, cx);
+                                        commit_slot(&clear_target, None, cx);
+                                    }),
+                            ),
                         ),
                 )
                 .child(
@@ -78,15 +97,18 @@ pub(super) fn action_library(
                 .p_1p5()
                 .when_some(current_action.as_ref(), |library, action| {
                     library.child(icon_editor(
-                        slot,
+                        target,
                         action,
                         current.and_then(ActionRingEntry::custom_icon),
                         pal,
                     ))
                 })
-                .child(shortcut_editor(slot, shortcut_input, pal))
-                .child(path_editor(slot, application_input, pal))
-                .children(action_sections(slot, current_action.as_ref(), pal)),
+                .child(inputs.render(None, &on_pick, pal, cx))
+                .children(action_sections(
+                    current_action.as_ref(),
+                    on_pick.clone(),
+                    pal,
+                )),
             library_scroll,
         ))
 }
@@ -104,12 +126,13 @@ fn action_rows_scroller(content: impl IntoElement, scroll: &ScrollHandle) -> imp
 }
 
 fn icon_editor(
-    slot: ActionRingSlot,
+    target: &RingEditorTarget,
     action: &Action,
     current: Option<ActionRingIcon>,
     pal: Palette,
 ) -> impl IntoElement {
     let default_path = action_icon_path(action);
+    let default_target = target.clone();
     let default = icon_button(
         "ring-default-icon",
         default_path,
@@ -117,7 +140,7 @@ fn icon_editor(
         current.is_none(),
         pal,
     )
-    .on_click(move |_, _, cx| commit_icon(slot, None, cx));
+    .on_click(move |_, _, cx| commit_icon(&default_target, None, cx));
 
     v_flex()
         .gap_1()
@@ -128,6 +151,7 @@ fn icon_editor(
                     .into_iter()
                     .enumerate()
                     .map(move |(index, icon)| {
+                        let target = target.clone();
                         icon_button(
                             ("ring-custom-icon", index),
                             icon.asset_path(),
@@ -135,7 +159,7 @@ fn icon_editor(
                             current == Some(icon),
                             pal,
                         )
-                        .on_click(move |_, _, cx| commit_icon(slot, Some(icon), cx))
+                        .on_click(move |_, _, cx| commit_icon(&target, Some(icon), cx))
                     }),
             ),
         )
@@ -156,72 +180,9 @@ fn icon_button(
         .tooltip(label)
 }
 
-fn shortcut_editor(
-    slot: ActionRingSlot,
-    input: &Entity<InputState>,
-    pal: Palette,
-) -> impl IntoElement {
-    let submit_input = input.clone();
-    v_flex()
-        .gap_1()
-        .child(editor_section(tr!("action_ring.custom_shortcut"), pal))
-        .child(
-            h_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(control_input(input).cleanable(true)),
-                )
-                .child(
-                    Button::new("ring-add-shortcut")
-                        .compact()
-                        .label(tr!("common.add"))
-                        .on_click(move |_, _, cx| {
-                            let shortcut = submit_input.read(cx).value().to_string();
-                            if let Ok(combo) = shortcut.parse::<KeyCombo>() {
-                                commit_action(slot, Action::CustomShortcut(combo), cx);
-                            }
-                        }),
-                ),
-        )
-}
-
-fn path_editor(slot: ActionRingSlot, input: &Entity<InputState>, pal: Palette) -> impl IntoElement {
-    let submit_input = input.clone();
-    v_flex()
-        .gap_1()
-        .child(editor_section(
-            tr!("action_ring.open_application_or_folder"),
-            pal,
-        ))
-        .child(
-            h_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(control_input(input).cleanable(true)),
-                )
-                .child(
-                    Button::new("ring-add-path")
-                        .compact()
-                        .label(tr!("common.add"))
-                        .on_click(move |_, _, cx| {
-                            let path = submit_input.read(cx).value().to_string();
-                            if let Ok(target) = ApplicationTarget::new(path, "") {
-                                commit_action(slot, Action::OpenApplication(target), cx);
-                            }
-                        }),
-                ),
-        )
-}
-
 fn action_sections(
-    slot: ActionRingSlot,
     current: Option<&Action>,
+    on_pick: PickFn,
     pal: Palette,
 ) -> impl Iterator<Item = impl IntoElement> {
     let mut index = 0usize;
@@ -233,6 +194,7 @@ fn action_sections(
             ))
             .children(actions.into_iter().map(|action| {
                 let selected = current == Some(&action);
+                let on_pick = on_pick.clone();
                 let action_to_commit = action.clone();
                 let label = localized_action_label(&action);
                 let icon_path = action_icon_path(&action);
@@ -262,8 +224,8 @@ fn action_sections(
                                 .text_color(rgb(theme::ACCENT_BLUE)),
                         )
                     })
-                    .on_click(move |_, _, cx| {
-                        commit_action(slot, action_to_commit.clone(), cx);
+                    .on_click(move |_, window, cx| {
+                        on_pick(action_to_commit.clone(), window, cx);
                     })
             }))
     })
@@ -288,19 +250,25 @@ fn ring_catalog() -> Vec<(Category, Vec<Action>)> {
     sections
 }
 
-fn commit_action(slot: ActionRingSlot, action: Action, cx: &mut gpui::App) {
+fn commit_action(target: &RingEditorTarget, action: Action, cx: &mut gpui::App) {
     let Ok(action) = RingAction::new(action) else {
         return;
     };
-    commit_slot(slot, Some(action), cx);
+    commit_slot(target, Some(action), cx);
 }
 
-fn commit_slot(slot: ActionRingSlot, action: Option<RingAction>, cx: &mut gpui::App) {
-    AppState::apply(cx, |state| state.commit_action_ring_slot(slot, action));
+fn commit_slot(target: &RingEditorTarget, action: Option<RingAction>, cx: &mut gpui::App) {
+    if target.is_current(cx) {
+        AppState::apply(cx, |state| {
+            state.commit_action_ring_slot(target.slot, action)
+        });
+    }
 }
 
-fn commit_icon(slot: ActionRingSlot, icon: Option<ActionRingIcon>, cx: &mut gpui::App) {
-    AppState::apply(cx, |state| state.commit_action_ring_icon(slot, icon));
+fn commit_icon(target: &RingEditorTarget, icon: Option<ActionRingIcon>, cx: &mut gpui::App) {
+    if target.is_current(cx) {
+        AppState::apply(cx, |state| state.commit_action_ring_icon(target.slot, icon));
+    }
 }
 
 #[cfg(test)]
