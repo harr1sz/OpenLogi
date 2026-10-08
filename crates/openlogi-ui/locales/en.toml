@@ -257,6 +257,12 @@ wheel_resolution_other_connection = "This device supports wheel resolution on it
 smartshift = "SmartShift"
 
 [actions]
+short_press = "Short press"
+long_press = "Long press (%{duration} ms)"
+shortcut_tap = "Tap"
+shortcut_hold = "Hold until release"
+hold_conversion_requires_tap = "To add a long press or gestures, change this shortcut from Hold to Tap first."
+invalid_shortcut = "Enter a key, optionally with modifiers, e.g. Ctrl+Shift+P."
 bind_control = "Bind %{name}"
 bind_control_in_app = "Bind %{name} in %{app}"
 unbound = "Unbound"
